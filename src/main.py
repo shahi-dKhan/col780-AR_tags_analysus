@@ -2,6 +2,9 @@ import cv2 # OpenCV - Only for video capture and display
 import argparse
 from utils import * # Define custom CV functions in utils.py
 
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="AR Tag Detection and Overlay")
     parser.add_argument("--video", type=str, help="Path to video file. If not provided, webcam (0) is used.", default=None)
@@ -21,14 +24,17 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
+        gray = threshold_image(frame)
+        islands = split_ROI(gray, min_sheet_area=5000)
+        print(len(islands))
+        island = render_ROI(frame, islands, 0)
+        # cv2.imshow("Frame", island)
         
-        cv2.imshow("Frame", frame)
-        
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # if cv2.waitKey(1) & 0xFF == ord('q'):
+        #     break
             
-    cap.release()
-    cv2.destroyAllWindows()
+    # cap.release()
+    # cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()

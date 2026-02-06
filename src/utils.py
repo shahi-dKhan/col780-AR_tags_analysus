@@ -16,7 +16,7 @@ def generate_tag(cell_size=50, tag_id=0):
     grid[2, 3] = 255
     grid[2, 4] = 255
     grid[2, 5] = 0
-    
+   
     # Row 3
     grid[3, 2] = 255
     grid[3, 3] = 255  # ID Bit 1
@@ -122,3 +122,78 @@ def render(img, obj, projection, model, color=False):
             cv2.fillConvexPoly(img, imgpts, color)
 
     return img
+
+
+class ARtag:
+    def __init__(self, corners, id):
+        self.corners = corners
+        self.id = id
+        
+    def code_to_id(self, code):
+        id = 0
+        for i in range(4):
+            id += code[i] * (2 ** (3 - i));
+        return id
+    
+
+
+def threshold_image(frame):
+    """Convert the image so that only the black and white regions are visible, and rest are masked
+
+    Args:
+        frame (): It is a numpy array of shape (H, W, 3) representing the input image
+        Returns:
+        bin_frame: A binary image of shape (H, W) where the pixels are either 0 or 255. The black and white regions are represented by 255, and the rest are represented by 0.
+    """
+    gray = 0.114 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.299 * frame[:, :, 2]
+    # threshold the image, without using cv2
+    thresh = 200
+    gray[gray < thresh] = 0
+    gray[gray >= thresh] = 255
+    
+    return gray.astype(np.uint8)
+
+def split_ROI(binary_image, min_sheet_area=500):
+    """Get the connected components in the binary image
+    
+    Args:
+        binary_image: A binary image of shape (H, W) where the pixels are either 0 or 255. The white regions are represented by 255, and the black regions are represented by 0.
+        Returns:
+        islands: A list of islands, where each island is a list of (y, x) coordinates of the pixels belonging to that island. Only islands with area greater than or equal to min_sheet_area are returned.
+    """
+    h, w = binary_image.shape
+    visited = np.zeros((h, w), dtype=bool)
+    islands = []
+    
+    x_mov = [-1, 0, 1, 0]
+    y_mov = [0, 1, 0, -1]
+    for y in range(h):
+        for x in range(w):
+            if binary_image[y, x] == 255 and not visited[y, x]:
+                island = []
+                stack = [(y, x)]
+                visited[y, x] = True
+                while stack:
+                    cy, cx = stack.pop()
+                    island.append((cy, cx))
+                    for direction in range(4):
+                        ny, nx = cy + y_mov[direction], cx + x_mov[direction]
+                        if 0 <= ny < h and 0 <= nx < w:
+                            if binary_image[ny, nx] == 255 and not visited[ny, nx]:
+                                visited[ny, nx] = True
+                                stack.append((ny, nx))
+                if len(island) >= min_sheet_area:
+                    islands.append(island)
+                    
+    return islands
+
+
+
+def render_ROI(image, island, index):
+    h, w, _ = image.shape
+    new_image = np.zeros((h, w, 3), dtype=np.uint8)
+    for (y, x) in island[index]:
+        new_image[y, x] = image[y, x]
+        
+    return new_image
+            
