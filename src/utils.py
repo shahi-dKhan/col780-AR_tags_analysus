@@ -147,7 +147,7 @@ def threshold_image(frame):
     """
     gray = 0.114 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.299 * frame[:, :, 2]
     # threshold the image, without using cv2
-    thresh = 200
+    thresh = 150
     gray[gray < thresh] = 0
     gray[gray >= thresh] = 255
     
@@ -196,4 +196,53 @@ def render_ROI(image, island, index):
         new_image[y, x] = image[y, x]
         
     return new_image
-            
+
+
+def detect_tag(image, island, gray_image):
+    detected_tags = []
+    # Can we first completely isolate the tag, like first we need to include the black part in the island, which is the outer border of the tag
+    # But how are we supposed to mask the complete background, how do we differentiate between the black background, and the black border of the tag
+    h, w = gray_image.shape
+    # First, we can find the bounding box of the island, and then we can check if the bounding box contains a tag or not
+    ys = [y for (y, x) in island]
+    xs = [x for (y, x) in island]
+    min_y, max_y = min(ys), max(ys)
+    min_x, max_x = min(xs), max(xs)
+    visited_black = set()
+    marker_pixels = []
+    x_hor = [0, 1, 0, -1]
+    y_hor = [1, 0, -1, 0]
+    for y in range(min_y, max_y + 1):
+        for x in range(min_x, max_x + 1):
+            if gray_image[y, x] == 0 and (y, x) not in visited_black:
+                touching_border = False
+                stack = [(y,x)]
+                visited_black.add((y,x))
+                black_region = []
+                while stack:
+                    cy, cx = stack.pop()
+                    black_region.append((cy, cx))
+                    for direction in range(4):
+                        ny, nx = cy + y_hor[direction], cx + x_hor[direction]
+                        if ny <= min_y or ny >= max_y or nx <= min_x or nx >= max_x:
+                            touching_border = True
+                            continue
+                        
+                        
+                        if gray_image[ny, nx] == 0 and (ny, nx) not in visited_black:
+                            visited_black.add((ny, nx))
+                            stack.append((ny, nx))
+                    # But how is it removing the corner black regions
+                if not touching_border:
+                    if len(black_region) > len(marker_pixels):
+                        marker_pixels = black_region
+    # Now we have the marker pixels, we can find the corners of the tag using the marker pixels, we can use the fact that the corners of the tag will be the farthest points
+    
+    return marker_pixels
+                    
+                
+
+
+
+def mark_corners(image, island, index, gray_image):
+    pass
