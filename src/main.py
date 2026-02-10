@@ -25,20 +25,19 @@ def main():
         if not ret:
             break
         gray = threshold_image(frame)
-        islands = split_ROI(gray, min_sheet_area=500)
-        # print(len(islands))
-        island = render_ROI(frame, islands, 0)
+        islands = split_ROI(gray, min_sheet_area=2000)
+        print("len(islands):", len(islands))
         marker_pixels = []
         for i in range(len(islands)):
             marker_pixel = detect_tag(frame, islands[i], gray)
-            marker_pixels.append(marker_pixel)
+            if marker_pixel is not None:
+                tag = decode_tag(marker_pixel, gray)
+                if tag:
+                    print(f"Detected Tag ID: {tag.id}")
+                    mark_corners(frame, tag)
         # make a image where only the marker pixel is white and the rest is black
         # print("Length of marker", len(marker_pixel))
-        marker_image = np.zeros_like(gray)
-        for marker_pixel in marker_pixels:
-            for (y, x) in marker_pixel:
-                marker_image[y, x] = 255
-        cv2.imshow("Frame", marker_image)
+        cv2.imshow("Frame", frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break

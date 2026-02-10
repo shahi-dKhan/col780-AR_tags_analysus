@@ -147,7 +147,7 @@ def threshold_image(frame):
     """
     gray = 0.114 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.299 * frame[:, :, 2]
     # threshold the image, without using cv2
-    thresh = 150
+    thresh = 220
     gray[gray < thresh] = 0
     gray[gray >= thresh] = 255
     
@@ -241,8 +241,229 @@ def detect_tag(image, island, gray_image):
     return marker_pixels
                     
                 
+# def get_corners(marker_pixels):
+#     print("Marker pixels:", np.array(marker_pixels).shape)
+#     pts = np.array(marker_pixels)
+#     # Use the fact that the corners will be the farthest points from each other
+#     s = pts.sum(axis=1)
+#     tl = pts[np.argmin(s)] # top-left has the smallest sum
+#     br = pts[np.argmax(s)] # bottom-right has the largest sum
+#     diff = np.diff(pts, axis=1)
+#     tr = pts[np.argmin(diff)] # top-right has the smallest difference
+#     bl = pts[np.argmax(diff)] # bottom-left has the largest difference
+#     return np.array([
+#         [tl[1], tl[0]], 
+#         [tr[1], tr[0]], 
+#         [br[1], br[0]], 
+#         [bl[1], bl[0]]
+#     ], dtype=np.float32)
+
+def get_corners(marker_pixels):
+    if not marker_pixels:
+        return None
+    
+    pts = np.array(marker_pixels)
+    # 1. Calculate the centroid of the black blob
+    center = np.mean(pts, axis=0) # (y, x)
+    
+    # 2. Define search directions (Top-Left, Top-Right, Bottom-Right, Bottom-Left)
+    # These represent the diagonal axes of a square
+    diagonals = np.array([
+        [-1, -1], # Towards Top-Left
+        [-1,  1], # Towards Top-Right
+        [ 1,  1], # Towards Bottom-Right
+        [ 1, -1]  # Towards Bottom-Left
+    ])
+    
+    corners = []
+    for d in diagonals:
+        # Subtract center to get vectors from centroid to every pixel
+        vectors = pts - center
+        # Dot product finds how far each pixel extends in direction 'd'
+        projections = np.dot(vectors, d)
+        # The pixel that reaches the furthest in that diagonal direction is the corner
+        corners.append(pts[np.argmax(projections)])
+        
+    corners = np.array(corners)
+    
+    # Flip (y, x) to (x, y) for Homography matrix consistency
+    return np.array([[p[1], p[0]] for p in corners], dtype=np.float32)
+
+def compute_homography(src_pts, dst_pts):
+    A = []
+    for i in range(4):
+        x, y = src_pts[i][0], src_pts[i][1]
+        u, v = dst_pts[i][0], dst_pts[i][1]
+        A.append([-x, -y, -1, 0, 0, 0, u*x, u*y, u])
+        A.append([0, 0, 0, -x, -y, -1, v*x, v*y, v])
+    A = np.array(A)
+    U, S, Vh = np.linalg.svd(A)
+    L = Vh[-1,:] / Vh[-1,-1]
+    H = L.reshape(3, 3)
+    return H
+
+def decode_tag(marker_pixels, gray_image): # Fixed argument order
+    h, w = gray_image.shape
+    
+    # 1. Get Geometric Corners
+    corners = get_corners(marker_pixels)
+    
+    # 2. Compute Homography (Ideal 8x8 -> Image)
+    src_pts = np.array([[0,0],[8,0],[8,8],[0,8]], dtype=np.float32)
+    dst_pts = corners.astype(np.float32)
+    H = compute_homography(src_pts, dst_pts)
+    
+    # 3. Sample the Grid
+    # grid_vals = np.zeros((8,8), dtype=np.uint8)
+    # offsets = [-0.25,0,0.25]
+    # for i in range(8):
+    #     for j in range(8):
+    #         cell_samples = []
+    #         for dx in offsets:
+    #             for dy in offsets:
+    #                 u_sample, v_sample = i + 0.5 + dx, j + 0.5 + dy
+    #                 denom = H[2,0]*u_sample + H[2,1]*v_sample + H[2,2]
+    #                 if abs(denom) < 1e-6:
+    #                     continue
+    #                 x_img = (H[0,0]*u_sample + H[0,1]*v_sample + H[0,2]) / denom
+    #                 y_img = (H[1,0]*u_sample + H[1,1]*v_sample + H[1,2]) / denom
+    #                 if 0 <= int(y_img) < h and 0 <= int(x_img) < w:
+    #                     cell_samples.append(gray_image[int(y_img), int(x_img)])
+    #         if cell_samples:
+    #             if np.mean(cell_samples) > 127:
+    #                 grid_vals[j, i] = 1
+    #             else:
+    #                 grid_vals[j, i] = 0
+                    
+                                                 
+    #         # u, v = i + 0.5, j + 0.5 # Sample center of cell
+            
+    #         # denom = H[2,0]*u + H[2,1]*v + H[2,2]
+    #         # if abs(denom) < 1e-6: continue
+            
+    #         # x_img = (H[0,0]*u + H[0,1]*v + H[0,2]) / denom
+    #         # y_img = (H[1,0]*u + H[1,1]*v + H[1,2]) / denom
+            
+    #         # if 0 <= int(y_img) < h and 0 <= int(x_img) < w:
+    #         #     # White = 1, Black = 0
+    #         #     if gray_image[int(y_img), int(x_img)] > 127:
+    #         #         grid_vals[j, i] = 1 # Store as (row, col)
+    #         #     else:
+    #         #         grid_vals[j, i] = 0
+    # Configuration
+    sample_resolution = 5  # 5x5 grid = 25 points per cell
+    margin = 0.2           # 20% margin on each side (only sample inner 60%)
+    
+    # Pre-calculate offsets (e.g., from -0.3 to +0.3)
+    # 0 is the center. 0.5 is the edge.
+    start = -0.5 + margin
+    end = 0.5 - margin
+    offsets = np.linspace(start, end, sample_resolution)
+
+    grid_vals = np.zeros((8, 8), dtype=np.uint8)
+
+    for i in range(8):       # Grid Columns
+        for j in range(8):   # Grid Rows
+            
+            cell_samples = []
+
+            for dy in offsets:
+                for dx in offsets:
+                    # u, v are the ideal coordinates
+                    u = i + 0.5 + dx
+                    v = j + 0.5 + dy
+                    
+                    # Project ideal(u,v) -> image(x,y)
+                    denom = H[2, 0]*u + H[2, 1]*v + H[2, 2]
+                    if abs(denom) < 1e-6: continue 
+                    
+                    x_img = (H[0, 0]*u + H[0, 1]*v + H[0, 2]) / denom
+                    y_img = (H[1, 0]*u + H[1, 1]*v + H[1, 2]) / denom
+                    
+                    if 0 <= int(y_img) < h and 0 <= int(x_img) < w:
+                        cell_samples.append(gray_image[int(y_img), int(x_img)])
+
+            # --- MEDIAN VOTING (Crucial for Glare) ---
+            if len(cell_samples) > 0:
+                cell_samples.sort()
+                mid_point = len(cell_samples) // 2
+                median_pixel = cell_samples[mid_point]
+                
+                # Threshold the Median
+                grid_vals[j, i] = 1 if median_pixel > 127 else 0
+    # 4. Check Orientation Marker
+    # Locations: (5,5)=0deg, (5,2)=90deg CW, (2,2)=180deg, (2,5)=270deg CW
+    rotation_steps = 0
+    if grid_vals[5, 5] == 1:
+        rotation_steps = 0
+    elif grid_vals[5, 2] == 1: 
+        rotation_steps = 1 # 90 deg Clockwise
+    elif grid_vals[2, 2] == 1: 
+        rotation_steps = 2 # 180 deg
+    elif grid_vals[2, 5] == 1: 
+        rotation_steps = 3 # 270 deg Clockwise
+    else:
+        return None # No marker found
+
+    # 5. Correct Orientation
+    if rotation_steps > 0:
+        # grid_vals is rotated CW, so we rotate CCW to fix it.
+        # np.rot90 rotates CCW by default. k=1 is 90 CCW.
+        grid_vals = np.rot90(grid_vals, k=rotation_steps)
+        
+        # Corners must be shifted to match.
+        # If image is 90 CW, the 'True TL' is currently at index 1 (TR).
+        # We need to shift Left (negative roll) to move index 1 to index 0.
+        corners = np.roll(corners, shift=-rotation_steps, axis=0)
+
+    # 6. Validate Border (Must be Black)
+    if grid_vals[0, 0] != 0 or grid_vals[0, 7] != 0 or \
+       grid_vals[7, 0] != 0 or grid_vals[7, 7] != 0:
+        return None
+    
+    # 7. Extract ID
+    b1 = grid_vals[3, 3]
+    b2 = grid_vals[3, 4]
+    b3 = grid_vals[4, 4]
+    b4 = grid_vals[4, 3]
+    
+    found_id = (b1 * 8) + (b2 * 4) + (b3 * 2) + (b4 * 1)
+    
+    return ARtag(corners, found_id)
+
+def mark_corners(image, tag):
+    if tag is None:
+        return
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 255, 255)]
+    corners = tag.corners
+    for i, point in enumerate(corners):
+        x, y = int(point[0]), int(point[1])
+        cv2.circle(image, (x, y), 8, colors[i], -1)
+        # Draw line to next corner
+        next_point = corners[(i + 1) % 4]
+        next_x, next_y = int(next_point[0]), int(next_point[1])
+        cv2.line(image, (x, y), (next_x, next_y), (0, 255, 0), 2)
+    
+    cx = int(sum(c[0] for c in corners) / 4)
+    cy = int(sum(c[1] for c in corners) / 4)
+    cv2.putText(image, str(tag.id), (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
 
+def process_frame(frame):
+    gray = threshold_image(frame)
+    islands = split_ROI(gray)
+    detected_tags = []
+    for island in islands:
+        marker_pixels = detect_tag(frame, island, gray)
+        if marker_pixels:
+            tag = decode_tag(gray, marker_pixels)
+            if tag:
+                detected_tags.append(tag)
+                
+    # 3. Visualize all found tags
+    for tag in detected_tags:
+        mark_corners(frame, tag)
+        # You can also call your render() function here
+        # render(frame, obj, projection, tag, ...)
 
-def mark_corners(image, island, index, gray_image):
-    pass
+    return frame

@@ -7,3 +7,7 @@
 Task 1: I need to understand hpow these vision things work, like rendering things into a video frame. 
 
 
+https://github.com/urastogi885/ar-tag-detection?tab=readme-ov-file#tag-detection
+
+
+Task 2: I need to understand how homography works.
