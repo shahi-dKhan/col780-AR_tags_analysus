@@ -12,7 +12,7 @@ def main():
     parser.add_argument("--model", type=str, help="Path to .obj model for 3D projection.", default=None)
     
     args = parser.parse_args()
-    
+    template_image = cv2.imread(args.template) if args.template else None
     video_source = args.video if args.video else 0
     cap = cv2.VideoCapture(video_source)
     
@@ -24,19 +24,22 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
-        gray = threshold_image(frame)
-        islands = split_ROI(gray, min_sheet_area=2000)
-        print("len(islands):", len(islands))
-        marker_pixels = []
-        for i in range(len(islands)):
-            marker_pixel = detect_tag(frame, islands[i], gray)
-            if marker_pixel is not None:
-                tag = decode_tag(marker_pixel, gray)
-                if tag:
-                    print(f"Detected Tag ID: {tag.id}")
-                    mark_corners(frame, tag)
+        # gray = threshold_image(frame)
+        # cv2.imshow("Thresholded", gray)
+        # islands = split_ROI(gray, min_sheet_area=2000)
+        # print("len(islands):", len(islands))
+        # marker_pixels = []
+        # for i in range(len(islands)):
+        #     marker_pixel = detect_tag(frame, islands[i], gray)
+        #     if marker_pixel is not None:
+        #         tag = decode_tag(marker_pixel, gray)
+        #         if tag:
+        #             print(f"Detected Tag ID: {tag.id}")
+        #             mark_corners(frame, tag)
+                    # frame = superimpose(frame, template_image, tag=tag)
         # make a image where only the marker pixel is white and the rest is black
         # print("Length of marker", len(marker_pixel))
+        frame = process_frame(frame)
         cv2.imshow("Frame", frame)
         
         if cv2.waitKey(1) & 0xFF == ord('q'):
