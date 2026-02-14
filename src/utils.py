@@ -525,12 +525,7 @@ def superimpose(video_frame, template_image, tag):
 
 
     
-def process_frame(frame):
-    # Cache template image; disk IO per frame is very slow.
-    if not hasattr(process_frame, "_template_img"):
-        process_frame._template_img = cv2.imread('./assets/iitd_logo_template.jpg')
-    template_img = process_frame._template_img
-    
+def process_frame_marking(frame):
     gray = threshold_image(frame)
     islands = split_ROI(gray)
     detected_tags = []
@@ -549,9 +544,26 @@ def process_frame(frame):
                 detected_tags.append(tag)      
     for tag in detected_tags:
         mark_corners(frame, tag)
-        # if template_img is not None:
-        #     frame = superimpose(frame, template_img, tag)
 
     return frame
+
+
+def process_frame_superimpose(frame, template_image_path):
+    gray = threshold_image(frame)
+    islands = split_ROI(gray)
+    detected_tags = []
+    
+    template_image = cv2.imread(template_image_path)
+
+    for island in islands:
+        marker_pixels = detect_tag(frame, island, gray)
+        if marker_pixels:
+            tag = decode_tag(marker_pixels, gray)
+            if tag:
+                detected_tags.append(tag)      
+    for tag in detected_tags:
+        frame = superimpose(frame, template_image, tag)
+    return frame
+    
 
 

@@ -26,7 +26,9 @@ def main():
         ret, frame = cap.read()
         if not ret:
             break
-        frame = process_frame(frame)
+        # frame = process_frame_marking(frame)
+        if args.template:
+            frame = process_frame_superimpose(frame, args.template)
 
         now_t = time.perf_counter()
         dt = now_t - prev_t
