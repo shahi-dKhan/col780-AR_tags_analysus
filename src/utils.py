@@ -522,6 +522,9 @@ def superimpose(video_frame, template_image, tag):
 
     
 
+
+
+    
 def process_frame(frame):
     # Cache template image; disk IO per frame is very slow.
     if not hasattr(process_frame, "_template_img"):
@@ -545,9 +548,9 @@ def process_frame(frame):
             if tag:
                 detected_tags.append(tag)      
     for tag in detected_tags:
-        # mark_corners(frame, tag)
-        if template_img is not None:
-            frame = superimpose(frame, template_img, tag)
+        mark_corners(frame, tag)
+        # if template_img is not None:
+        #     frame = superimpose(frame, template_img, tag)
 
     return frame
 
