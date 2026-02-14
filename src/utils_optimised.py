@@ -826,7 +826,7 @@ def read_intrinsics(path):
 
 _obj_cache = {}
 
-def process_frame_3D(frame, model_path, intrinsics_path, scale_3d=50.0, scale=4):
+def process_frame_3D(frame, model_path, intrinsics_path, scale_3d=50.0, scale=4, smoother=None):
     gray = threshold_image(frame)
     islands = split_ROI(gray, scale=scale)
     K = read_intrinsics(intrinsics_path)
@@ -844,7 +844,7 @@ def process_frame_3D(frame, model_path, intrinsics_path, scale_3d=50.0, scale=4)
                     frame = render(frame, obj, P, scale=scale_3d)
     return frame
 
-def process_frame_marking(frame, scale=4):
+def process_frame_marking(frame, scale=4, smoother=None):
     gray = threshold_image(frame)
     islands = split_ROI(gray, scale=scale)
     detected_tags = []
@@ -872,7 +872,7 @@ def process_frame_marking(frame, scale=4):
         
     return frame
 
-def process_frame_superimpose(frame, template_path, scale=4):
+def process_frame_superimpose(frame, template_path, scale=4, smoother=None):
     template = cv2.imread(template_path)
     if template is None: return frame
     gray = threshold_image(frame)

@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from numba import njit
+from collections import deque
 # Import your manual optimized functions (only the ones actually used)
 from manual_optimised import (
     convex_hull_contour,
@@ -11,234 +12,215 @@ from manual_optimised import (
     warp_perspective,
 )
 
-class TagSmoother:
-    def __init__(self, alpha=0.1, max_dist=100.0):
-        self.alpha = alpha
-        self.max_dist = max_dist 
-        self.history = {}
 
-    def update(self, detected_tags):
-        smoothed_tags = []
-        for tag in detected_tags:
-            tid = tag.id
-            if tid in self.history:
-                prev_tag = self.history[tid]
-                
-                # Check if the corners moved an unrealistic amount (a "jump")
-                dist = np.linalg.norm(prev_tag.corners - tag.corners)
-                
-                if dist > self.max_dist:
-                    # Too far! Re-initialize instead of smoothing
-                    self.history[tid] = tag
-                    smoothed_tags.append(tag)
-                else:
-                    # Smoothly interpolate
-                    smoothed_corners = (1 - self.alpha) * prev_tag.corners + self.alpha * tag.corners
-                    tag.corners = smoothed_corners
-                    self.history[tid] = tag
-                    smoothed_tags.append(tag)
-            else:
-                self.history[tid] = tag
-                smoothed_tags.append(tag)
-        return smoothed_tags
-
-
-class KalmanTagSmoother:
-    """Per-tag Kalman filter over the 4 tag corners.
-
-    State: [x1..x4, y1..y4, vx1..vx4, vy1..vy4]  (16D)
-    Measurement: [x1..x4, y1..y4]               (8D)
-
-    Uses a constant-velocity model in the image plane. This handles a moving
-    camera better than EMA because it predicts motion and reduces lag.
+class KalmanCornerTracker:
     """
-
-    def __init__(
-        self,
-        dt: float = 1.0 / 30.0,
-        sigma_accel: float = 3000.0,
-        sigma_meas: float = 6.0,
-        init_pos_var: float = 1e3,
-        init_vel_var: float = 1e4,
-        gate_mahal_sq: float = 5000.0,
-        match_max_dist: float = 250.0,
-        max_age_frames: int = 60,
-    ):
-        self.dt = float(dt)
-        self.sigma_accel = float(sigma_accel)
-        self.sigma_meas = float(sigma_meas)
-        self.init_pos_var = float(init_pos_var)
-        self.init_vel_var = float(init_vel_var)
-        self.gate_mahal_sq = float(gate_mahal_sq)
-        self.match_max_dist = float(match_max_dist)
-        self.max_age_frames = int(max_age_frames)
-
-        # Allow multiple simultaneous tags with the same id.
-        # tid -> list of dict(x,P,last_seen)
-        self._filters = {}
-        self._frame_idx = 0
-
-    def set_dt(self, dt: float):
-        dt = float(dt)
-        if not np.isfinite(dt) or dt <= 0:
-            return
-        self.dt = max(1e-4, min(dt, 1.0))
-
-    def _build_mats(self, dt: float):
-        # A: constant velocity for 8 independent coordinates
-        A = np.eye(16, dtype=np.float64)
-        A[0:8, 8:16] = np.eye(8, dtype=np.float64) * dt
-
-        # H: observe positions only
-        H = np.zeros((8, 16), dtype=np.float64)
-        H[0:8, 0:8] = np.eye(8, dtype=np.float64)
-
-        # R: measurement noise
-        R = (self.sigma_meas ** 2) * np.eye(8, dtype=np.float64)
-
-        # Q: acceleration noise (per-dimension), block-diagonal via kron
-        dt2 = dt * dt
-        dt3 = dt2 * dt
-        dt4 = dt2 * dt2
-        q11 = dt4 / 4.0
-        q12 = dt3 / 2.0
-        q22 = dt2
-        Q1 = np.array([[q11, q12], [q12, q22]], dtype=np.float64) * (self.sigma_accel ** 2)
-        Q = np.kron(np.eye(8, dtype=np.float64), Q1)
-        return A, H, Q, R
-
-    def _init_filter(self, z: np.ndarray):
-        x = np.zeros((16,), dtype=np.float64)
-        x[0:8] = z
-        P = np.zeros((16, 16), dtype=np.float64)
-        P[0:8, 0:8] = np.eye(8, dtype=np.float64) * self.init_pos_var
-        P[8:16, 8:16] = np.eye(8, dtype=np.float64) * self.init_vel_var
-        return {"x": x, "P": P, "last_seen": self._frame_idx}
-
-    def _predict(self, filt, A, Q):
-        x = filt["x"]
-        P = filt["P"]
-        filt["x"] = A @ x
-        filt["P"] = A @ P @ A.T + Q
-
-    def _update(self, filt, z, H, R):
-        x = filt["x"]
-        P = filt["P"]
-
-        y = z - (H @ x)
-        S = H @ P @ H.T + R
-
-        try:
-            S_inv = np.linalg.inv(S)
-        except np.linalg.LinAlgError:
-            return False
-
-        mahal_sq = float(y.T @ S_inv @ y)
-        if not np.isfinite(mahal_sq) or mahal_sq > self.gate_mahal_sq:
-            return False
-
-        K = P @ H.T @ S_inv
-        filt["x"] = x + (K @ y)
-        I = np.eye(16, dtype=np.float64)
-        filt["P"] = (I - K @ H) @ P
-        return True
-
-    def update(self, detected_tags):
-        self._frame_idx += 1
-
-        dt = float(self.dt)
-        A, H, Q, R = self._build_mats(dt)
-
-        # Group detections by id
-        by_id = {}
-        for tag in detected_tags:
-            by_id.setdefault(tag.id, []).append(tag)
-
-        smoothed = []
-        max_d = float(self.match_max_dist)
-
-        for tid, tags in by_id.items():
-            tracks = self._filters.get(tid, [])
-
-            # Predict all existing tracks forward one step
-            for tr in tracks:
-                self._predict(tr, A, Q)
-
-            # Compute measurement centers
-            meas = []  # (tag, z, center)
-            for tag in tags:
-                z = np.asarray(tag.corners, dtype=np.float64).reshape(-1)
-                if z.shape[0] != 8 or not np.all(np.isfinite(z)):
-                    meas.append((tag, None, None))
-                    continue
-                c = z.reshape(4, 2).mean(axis=0)
-                meas.append((tag, z, c))
-
-            # Compute predicted centers
-            pred_centers = []
-            for tr in tracks:
-                c = tr["x"][0:8].reshape(4, 2).mean(axis=0)
-                pred_centers.append(c)
-
-            used_tracks = set()
-            assigned_track_for_meas = [None] * len(meas)
-
-            # Greedy assignment by smallest center distance
-            pairs = []
-            for mi, (_, z, c) in enumerate(meas):
-                if z is None:
-                    continue
-                for ti, pc in enumerate(pred_centers):
-                    d = float(np.linalg.norm(c - pc))
-                    if d <= max_d:
-                        pairs.append((d, mi, ti))
-            pairs.sort(key=lambda t: t[0])
-
-            for _, mi, ti in pairs:
-                if assigned_track_for_meas[mi] is not None:
-                    continue
-                if ti in used_tracks:
-                    continue
-                assigned_track_for_meas[mi] = ti
-                used_tracks.add(ti)
-
-            # Update or create tracks per measurement, and output a smoothed tag per detection
-            for mi, (tag, z, _c) in enumerate(meas):
-                if z is None:
-                    smoothed.append(tag)
-                    continue
-
-                ti = assigned_track_for_meas[mi]
-                if ti is None:
-                    tr = self._init_filter(z)
-                    tracks.append(tr)
-                else:
-                    tr = tracks[ti]
-                    ok = self._update(tr, z, H, R)
-                    if not ok:
-                        tr = self._init_filter(z)
-                        tracks[ti] = tr
-
-                tr["last_seen"] = self._frame_idx
-                corners_sm = tr["x"][0:8].reshape(4, 2).astype(np.float32)
-                smoothed.append(ARtag(corners_sm, tid, tag.orientation_steps))
-
-            self._filters[tid] = tracks
-
-        # Drop stale tracks
-        if self.max_age_frames > 0 and len(self._filters) > 0:
-            drop_before = self._frame_idx - self.max_age_frames
-            tids = list(self._filters.keys())
-            for tid in tids:
-                tracks = self._filters.get(tid, [])
-                tracks = [tr for tr in tracks if tr.get("last_seen", 0) >= drop_before]
-                if tracks:
-                    self._filters[tid] = tracks
-                else:
-                    self._filters.pop(tid, None)
-
-        return smoothed
+    Kalman filter for tracking a single corner point with constant velocity model.
+    State: [x, y, vx, vy] - position and velocity
+    """
+    def __init__(self, initial_pos, process_noise=1.0, measurement_noise=5.0):
+        """
+        Args:
+            initial_pos: Initial [x, y] position
+            process_noise: Process noise (motion model uncertainty)
+            measurement_noise: Measurement noise (detection uncertainty)
+        """
+        # State: [x, y, vx, vy]
+        self.state = np.array([initial_pos[0], initial_pos[1], 0.0, 0.0], dtype=np.float32)
+        
+        # State covariance matrix (uncertainty in state estimate)
+        self.P = np.eye(4, dtype=np.float32) * 100.0
+        
+        # State transition matrix (constant velocity model)
+        # x_new = x + vx*dt, y_new = y + vy*dt, vx_new = vx, vy_new = vy
+        dt = 1.0  # Assuming constant frame rate
+        self.F = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        # Measurement matrix (we only measure position, not velocity)
+        self.H = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        # Process noise covariance
+        self.Q = np.eye(4, dtype=np.float32) * process_noise
+        self.Q[2:, 2:] *= 2.0  # Higher uncertainty in velocity
+        
+        # Measurement noise covariance
+        self.R = np.eye(2, dtype=np.float32) * measurement_noise
     
+    def predict(self):
+        """Predict next state using motion model."""
+        # State prediction
+        self.state = self.F @ self.state
+        
+        # Covariance prediction
+        self.P = self.F @ self.P @ self.F.T + self.Q
+        
+        return self.state[:2]  # Return predicted position
+    
+    def update(self, measurement):
+        """Update state with new measurement."""
+        measurement = np.array(measurement, dtype=np.float32)
+        
+        # Innovation (measurement residual)
+        y = measurement - (self.H @ self.state)
+        
+        # Innovation covariance
+        S = self.H @ self.P @ self.H.T + self.R
+        
+        # Kalman gain
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        
+        # State update
+        self.state = self.state + K @ y
+        
+        # Covariance update
+        I = np.eye(4, dtype=np.float32)
+        self.P = (I - K @ self.H) @ self.P
+        
+        return self.state[:2]  # Return updated position
+    
+    def get_position(self):
+        """Get current position estimate."""
+        return self.state[:2].copy()
+    
+    def get_velocity(self):
+        """Get current velocity estimate."""
+        return self.state[2:].copy()
+
+
+class KalmanTagTracker:
+    """Tracks AR tag corners using Kalman filters with constant velocity motion model."""
+    def __init__(self, process_noise=2.0, measurement_noise=5.0, max_missing_frames=5, max_innovation=150):
+        """
+        Args:
+            process_noise: Process noise for Kalman filter (motion uncertainty).
+            measurement_noise: Measurement noise (detection uncertainty).
+            max_missing_frames: Maximum frames before removing tag from tracking.
+            max_innovation: Maximum innovation (measurement - prediction) to accept measurement.
+        """
+        self.process_noise = process_noise
+        self.measurement_noise = measurement_noise
+        self.max_missing_frames = max_missing_frames
+        self.max_innovation = max_innovation
+        self.tag_trackers = {}  # {tag_id: {'filters': [4 KalmanCornerTrackers], 'frames_missing': int}}
+    
+    def track_corners(self, tag_id, measured_corners):
+        """
+        Track tag corners with Kalman filtering.
+        
+        Args:
+            tag_id: Integer ID of the detected tag.
+            measured_corners: Newly detected corners (4x2 array).
+        
+        Returns:
+            Smoothed corners (4x2 array).
+        """
+        if tag_id not in self.tag_trackers:
+            # Initialize Kalman filters for each corner
+            filters = [
+                KalmanCornerTracker(measured_corners[i], self.process_noise, self.measurement_noise)
+                for i in range(4)
+            ]
+            self.tag_trackers[tag_id] = {
+                'filters': filters,
+                'frames_missing': 0
+            }
+            return measured_corners  # Return initial measurement as-is
+        
+        tag_data = self.tag_trackers[tag_id]
+        filters = tag_data['filters']
+        smoothed_corners = np.zeros((4, 2), dtype=np.float32)
+        
+        for i in range(4):
+            # Predict next position
+            predicted_pos = filters[i].predict()
+            
+            # Check innovation (difference between measurement and prediction)
+            innovation = np.linalg.norm(measured_corners[i] - predicted_pos)
+            
+            if innovation > self.max_innovation:
+                # Measurement too far from prediction - likely wrong association or occlusion
+                # Reinitialize this corner's filter
+                filters[i] = KalmanCornerTracker(
+                    measured_corners[i], 
+                    self.process_noise, 
+                    self.measurement_noise
+                )
+                smoothed_corners[i] = measured_corners[i]
+            else:
+                # Update with measurement
+                smoothed_corners[i] = filters[i].update(measured_corners[i])
+        
+        tag_data['frames_missing'] = 0
+
+        # ---- RIGID QUAD ENFORCEMENT ----
+        c = np.mean(smoothed_corners, axis=0)
+
+        # Edge vectors from corner 0
+        v1 = smoothed_corners[1] - smoothed_corners[0]
+        v2 = smoothed_corners[3] - smoothed_corners[0]
+
+        # Reconstruct corner 2 rigidly
+        smoothed_corners[2] = smoothed_corners[0] + v1 + v2
+
+        return smoothed_corners
+   
+    def predict_missing_tag(self, tag_id):
+        """
+        Predict tag position when not detected (for brief occlusions).
+        
+        Args:
+            tag_id: Integer ID of the tag.
+        
+        Returns:
+            Predicted corners (4x2 array) or None if tag not tracked.
+        """
+        if tag_id not in self.tag_trackers:
+            return None
+        
+        filters = self.tag_trackers[tag_id]['filters']
+        predicted_corners = np.zeros((4, 2), dtype=np.float32)
+        
+        for i in range(4):
+            predicted_corners[i] = filters[i].predict()
+        
+        return predicted_corners
+    
+    def update_missing_tags(self, detected_tag_ids):
+        """
+        Update tracking for tags that weren't detected in current frame.
+        
+        Args:
+            detected_tag_ids: Set of tag IDs detected in current frame.
+        """
+        ids_to_remove = []
+        for tag_id in self.tag_trackers:
+            if tag_id not in detected_tag_ids:
+                self.tag_trackers[tag_id]['frames_missing'] += 1
+                if self.tag_trackers[tag_id]['frames_missing'] > self.max_missing_frames:
+                    ids_to_remove.append(tag_id)
+        
+        for tag_id in ids_to_remove:
+            del self.tag_trackers[tag_id]
+    
+    def reset(self):
+        """Clear all tracking history."""
+        self.tag_trackers.clear()
+
+
+# Global Kalman trackers for different processing modes - Tuned for smoother tracking
+_tracker_superimpose = KalmanTagTracker(process_noise=0.2, measurement_noise=30.0, max_innovation=150)
+_tracker_3d = KalmanTagTracker(process_noise=0.5, measurement_noise=12.0, max_innovation=150)
+_tracker_marking = KalmanTagTracker(process_noise=0.8, measurement_noise=10.0, max_innovation=150)
+_depth_memory = {}  
+
 def generate_tag(cell_size=50, tag_id=0):
     """
     Generate an AR tag image with the specified ID.
@@ -515,14 +497,22 @@ def decode_tag(marker_pixels, gray_image):
     found_id = (grid_vals[3,3]*8) + (grid_vals[3,4]*4) + (grid_vals[4,4]*2) + (grid_vals[4,3]*1)
     return ARtag(corners, found_id, rotation)
 
-def compute_projection_matrix(corners, K):
+def compute_projection_matrix(corners, K, tag_id = None, alpha = 0.1):
     src_pts = np.array([[0,0], [200,0], [200,200], [0,200]], dtype=np.float32)
     H = compute_homography_manual(src_pts, corners)
     try:
         inv_K = np.linalg.inv(K)
         A = inv_K @ H
         col1 = A[:, 0]; col2 = A[:, 1]; col3 = A[:, 2]
-        norm = (np.linalg.norm(col1) + np.linalg.norm(col2)) / 2.0
+        raw_norm = (np.linalg.norm(col1) + np.linalg.norm(col2)) / 2.0
+        if raw_norm == 0: return None
+        if tag_id is not None:
+            if tag_id not in _depth_memory:
+                _depth_memory[tag_id] = raw_norm
+            else:
+                _depth_memory[tag_id] = alpha * raw_norm + (1 - alpha) * _depth_memory[tag_id]
+            norm = _depth_memory[tag_id]
+                
         if norm == 0: return None
         r1 = col1 / norm; r2 = col2 / norm; t = col3 / norm
         r3 = np.cross(r1, r2)
@@ -604,44 +594,60 @@ def read_intrinsics(path):
 
 _obj_cache = {}
 
-def process_frame_3D(frame, model_path, intrinsics_path, scale_3d=50.0, scale=4, smoother = None):
+def process_frame_3D(frame, model_path, intrinsics_path, scale_3d=50.0, scale=4, smoother=None):
     gray = threshold_image(frame)
     islands = split_ROI(gray, scale=scale)
     K = read_intrinsics(intrinsics_path)
     if model_path not in _obj_cache:
         _obj_cache[model_path] = OBJ(model_path, swapyz=True)
     obj = _obj_cache[model_path]
-    detected_tags = []
+    
+    # Use provided smoother or default global tracker
+    tracker = smoother if smoother is not None else _tracker_3d
+    detected_tag_ids = set()
+    
     for island in islands:
         marker_pixels = detect_tag(frame, island, gray, scale=scale)
         if marker_pixels:
             tag = decode_tag(marker_pixels, gray)
             if tag:
-                detected_tags.append(tag)
+                detected_tag_ids.add(tag.id)
                 
-    if smoother is not None:
-        detected_tags = smoother.update(detected_tags)
-        
-    for tag in detected_tags:
-        P = compute_projection_matrix(tag.corners, K)
-        if P is not None:
-            frame = render(frame, obj, P, scale=scale_3d)
+                # Apply Kalman tracking
+                tracked_corners = tracker.track_corners(tag.id, tag.corners)
+                
+                P = compute_projection_matrix(tracked_corners, K, tag_id=tag.id, alpha=0.1)
+                if P is not None:
+                    frame = render(frame, obj, P, scale=scale_3d)
+    
+    # Update missing tags
+    tracker.update_missing_tags(detected_tag_ids)
+    
     return frame
 
 def process_frame_marking(frame, scale=4, smoother=None):
     gray = threshold_image(frame)
     islands = split_ROI(gray, scale=scale)
     detected_tags = []
+    detected_tag_ids = set()
+    
+    # Use provided smoother or default global tracker
+    tracker = smoother if smoother is not None else _tracker_marking
     
     for island in islands:
         marker_pixels = detect_tag(frame, island, gray, scale=scale)
         if marker_pixels:
             tag = decode_tag(marker_pixels, gray)
             if tag:
+                detected_tag_ids.add(tag.id)
+                
+                # Apply Kalman tracking
+                tag.corners = tracker.track_corners(tag.id, tag.corners)
+                
                 detected_tags.append(tag)
     
-    if smoother is not None:
-        detected_tags = smoother.update(detected_tags)
+    # Update missing tags
+    tracker.update_missing_tags(detected_tag_ids)
     
     for tag in detected_tags:
         colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (0, 255, 255)]
@@ -659,7 +665,7 @@ def process_frame_marking(frame, scale=4, smoother=None):
         
     return frame
 
-def process_frame_superimpose(frame, template_path, scale=4, smoother = None):
+def process_frame_superimpose(frame, template_path, scale=4, smoother=None):
     template = cv2.imread(template_path)
     if template is None: return frame
     gray = threshold_image(frame)
@@ -668,26 +674,30 @@ def process_frame_superimpose(frame, template_path, scale=4, smoother = None):
     src_pts = np.array([[0,0], [w_temp,0], [w_temp,h_temp], [0,h_temp]], dtype=np.float32)
     
     frame_h, frame_w = frame.shape[:2]
-    detected_tags = []
+    detected_tag_ids = set()
+    
+    # Use provided smoother or default global tracker
+    tracker = smoother if smoother is not None else _tracker_superimpose
+    
     for island in islands:
         marker_pixels = detect_tag(frame, island, gray, scale=scale)
         if marker_pixels:
             tag = decode_tag(marker_pixels, gray)
             if tag:
-                detected_tags.append(tag)
-    if smoother is not None:
-        detected_tags = smoother.update(detected_tags)
- 
-    for tag in detected_tags:
-        H = compute_homography_manual(src_pts, tag.corners)
-        warped = warp_perspective(template, H, (frame_w, frame_h))
-
-        mask_src = np.ones((h_temp, w_temp, 1), dtype=np.uint8) * 255
-        mask_warped = warp_perspective(mask_src, H, (frame_w, frame_h))
-        mask_bool = mask_warped[:, :, 0] > 0
-        frame[mask_bool] = warped[mask_bool]
-
+                detected_tag_ids.add(tag.id)
+                
+                # Apply Kalman tracking
+                tracked_corners = tracker.track_corners(tag.id, tag.corners)
+                
+                H = compute_homography_manual(src_pts, tracked_corners)
+                warped = warp_perspective(template, H, (frame_w, frame_h))
+                mask_src = np.ones((h_temp, w_temp, 1), dtype=np.uint8) * 255
+                mask_warped = warp_perspective(mask_src, H, (frame_w, frame_h))
+                mask_bool = mask_warped[:, :, 0] > 0
+                frame[mask_bool] = warped[mask_bool]
+    
+    # Update missing tags
+    tracker.update_missing_tags(detected_tag_ids)
+                
     return frame
-
-
 

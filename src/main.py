@@ -3,6 +3,7 @@ import argparse
 import time
 import os
 from smoothening_utils import * # Define custom CV functions in utils.py
+# from utils_optimised import *
 def main():
     parser = argparse.ArgumentParser(description="AR Tag Detection and Overlay")
     parser.add_argument("--video", type=str, help="Path to video file. If not provided, webcam (0) is used.", default=None)
@@ -25,15 +26,12 @@ def main():
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     video_fps = cap.get(cv2.CAP_PROP_FPS)
 
-    # Kalman smoother for moving-camera jitter (corner positions only)
     fps_for_dt = float(video_fps) if video_fps and video_fps > 1e-3 else 30.0
-    my_smoother = KalmanTagSmoother(
-        dt=1.0 / fps_for_dt,
-        match_max_dist=250.0,
-        sigma_accel=2500.0,
-        sigma_meas=4.0,
-        gate_mahal_sq=8000.0,
-    )
+    
+    # Create Kalman trackers for smoothing - Lower process noise and higher measurement noise = more smoothing
+    kalman_tracker_3d = KalmanTagTracker(process_noise=0.5, measurement_noise=12.0, max_innovation=150)
+    kalman_tracker_2d = KalmanTagTracker(process_noise=0.5, measurement_noise=12.0, max_innovation=150)
+    kalman_tracker_marking = KalmanTagTracker(process_noise=0.8, measurement_noise=10.0, max_innovation=150)
     
     # Setup video writer - always save output
     os.makedirs("results", exist_ok=True)
@@ -42,18 +40,12 @@ def main():
     out = cv2.VideoWriter(output_path, fourcc, video_fps, (frame_width, frame_height))
     print(f"Saving output to: {output_path}")
 
-    prev_t = time.perf_counter()
-    fps = 0.0
     frame_count = 0
-
+    fps = 0.0
     window_name = "Frame"
     
     while cap.isOpened():
-        now_t = time.perf_counter()
-        dt = now_t - prev_t
-        prev_t = now_t
-        if dt > 0 and "my_smoother" in locals() and my_smoother is not None and hasattr(my_smoother, "set_dt"):
-            my_smoother.set_dt(dt)
+        start_time = time.perf_counter()
 
         ret, frame = cap.read()
         if not ret:
@@ -64,13 +56,16 @@ def main():
         # Process frame based on mode
         if args.model:
             # 3D model rendering
-            frame = process_frame_3D(frame, args.model, args.intrinsics, scale_3d = args.scale, scale=4, smoother=my_smoother)
+            frame = process_frame_3D(frame, args.model, args.intrinsics, scale_3d=args.scale, scale=4, smoother=kalman_tracker_3d)
         elif args.template:
             # 2D template superimposition
-            frame = process_frame_superimpose(frame, args.template, scale=4, smoother=my_smoother)
+            frame = process_frame_superimpose(frame, args.template, scale=4, smoother=kalman_tracker_2d)
         else:
             # Just mark corners
-            frame = process_frame_marking(frame, smoother=my_smoother)
+            frame = process_frame_marking(frame, scale=4, smoother=kalman_tracker_marking)
+
+        end_time = time.perf_counter()
+        dt = end_time - start_time
 
         if dt > 0:
             inst_fps = 1.0 / dt
