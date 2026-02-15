@@ -97,19 +97,21 @@ class KalmanCornerTracker:
 
 class KalmanTagTracker:
     """Tracks AR tag corners using Kalman filters with constant velocity motion model."""
-    def __init__(self, process_noise=2.0, measurement_noise=5.0, max_missing_frames=5, max_innovation=150):
+    def __init__(self, process_noise=2.0, measurement_noise=5.0, max_missing_frames=5, max_innovation=150, orientation_alpha=0.3):
         """
         Args:
             process_noise: Process noise for Kalman filter (motion uncertainty).
             measurement_noise: Measurement noise (detection uncertainty).
             max_missing_frames: Maximum frames before removing tag from tracking.
             max_innovation: Maximum innovation (measurement - prediction) to accept measurement.
+            orientation_alpha: Smoothing factor for orientation (0=no update, 1=no smoothing).
         """
         self.process_noise = process_noise
         self.measurement_noise = measurement_noise
         self.max_missing_frames = max_missing_frames
         self.max_innovation = max_innovation
-        self.tag_trackers = {}  # {tag_id: {'filters': [4 KalmanCornerTrackers], 'frames_missing': int}}
+        self.orientation_alpha = orientation_alpha
+        self.tag_trackers = {}  # {tag_id: {'filters': [4 KalmanCornerTrackers], 'frames_missing': int, 'orientation': float}}
     
     def track_corners(self, tag_id, measured_corners):
         """
@@ -130,7 +132,8 @@ class KalmanTagTracker:
             ]
             self.tag_trackers[tag_id] = {
                 'filters': filters,
-                'frames_missing': 0
+                'frames_missing': 0,
+                'orientation': None  # Will be set when orientation is provided
             }
             return measured_corners  # Return initial measurement as-is
         
@@ -171,6 +174,55 @@ class KalmanTagTracker:
         smoothed_corners[2] = smoothed_corners[0] + v1 + v2
 
         return smoothed_corners
+    
+    def smooth_orientation(self, tag_id, measured_orientation):
+        """
+        Smooth orientation angle using exponential moving average.
+        Handles wrap-around at 0/360 degrees properly.
+        
+        Args:
+            tag_id: Integer ID of the tag
+            measured_orientation: New orientation measurement in degrees (0-360)
+        
+        Returns:
+            Smoothed orientation in degrees (0-360)
+        """
+        if tag_id not in self.tag_trackers:
+            return measured_orientation
+        
+        tag_data = self.tag_trackers[tag_id]
+        
+        # Initialize if first time
+        if tag_data['orientation'] is None:
+            tag_data['orientation'] = measured_orientation
+            return measured_orientation
+        
+        prev_orientation = tag_data['orientation']
+        
+        # Handle wrap-around: convert to circular mean
+        # Use vectors to avoid 0/360 discontinuity
+        prev_rad = np.deg2rad(prev_orientation)
+        meas_rad = np.deg2rad(measured_orientation)
+        
+        # Exponential moving average in vector space
+        prev_x = np.cos(prev_rad)
+        prev_y = np.sin(prev_rad)
+        meas_x = np.cos(meas_rad)
+        meas_y = np.sin(meas_rad)
+        
+        # Smooth
+        smooth_x = (1 - self.orientation_alpha) * prev_x + self.orientation_alpha * meas_x
+        smooth_y = (1 - self.orientation_alpha) * prev_y + self.orientation_alpha * meas_y
+        
+        # Convert back to angle
+        smooth_orientation = np.rad2deg(np.arctan2(smooth_y, smooth_x))
+        
+        # Normalize to 0-360
+        if smooth_orientation < 0:
+            smooth_orientation += 360.0
+        
+        tag_data['orientation'] = smooth_orientation
+        return smooth_orientation
    
     def predict_missing_tag(self, tag_id):
         """
@@ -216,9 +268,9 @@ class KalmanTagTracker:
 
 
 # Global Kalman trackers for different processing modes - Tuned for smoother tracking
-_tracker_superimpose = KalmanTagTracker(process_noise=0.2, measurement_noise=30.0, max_innovation=150)
-_tracker_3d = KalmanTagTracker(process_noise=0.5, measurement_noise=12.0, max_innovation=150)
-_tracker_marking = KalmanTagTracker(process_noise=0.8, measurement_noise=10.0, max_innovation=150)
+_tracker_superimpose = KalmanTagTracker(process_noise=0.2, measurement_noise=30.0, max_innovation=150, orientation_alpha=0.05)
+_tracker_3d = KalmanTagTracker(process_noise=0.5, measurement_noise=12.0, max_innovation=150, orientation_alpha=0.05)
+_tracker_marking = KalmanTagTracker(process_noise=0.8, measurement_noise=10.0, max_innovation=150, orientation_alpha=0.05)
 _depth_memory = {}  
 
 def generate_tag(cell_size=50, tag_id=0):
@@ -318,11 +370,21 @@ def fast_component_labeling_local(binary_img, roi_offset_y, roi_offset_x):
 
 
 def threshold_image(frame):
+    """
+    Convert frame to binary using Otsu's automatic thresholding.
+    Better than adaptive for high-contrast AR tags.
+    """
+    # Convert to grayscale
     gray = 0.114 * frame[:, :, 0] + 0.587 * frame[:, :, 1] + 0.299 * frame[:, :, 2]
     gray = gray.astype(np.uint8)
-    thresh_val = 150
-    binary = np.zeros_like(gray)
-    binary[gray >= thresh_val] = 255
+    
+    # Apply slight Gaussian blur to reduce noise before thresholding
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # Otsu's thresholding - automatically finds optimal threshold
+    # Works excellently for bimodal histograms (AR tags: black vs white)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     return binary
 
 
@@ -411,19 +473,34 @@ def get_corners(marker_pixels):
             break
 
     if corners is None: return None
+    
+    # Robust corner ordering: always start from top-left, go clockwise
+    # 1. Find center
     center = np.mean(corners, axis=0)
+    
+    # 2. Sort by angle (counter-clockwise from positive x-axis)
     angles = np.arctan2(corners[:, 1] - center[1], corners[:, 0] - center[0])
-    corners = corners[np.argsort(angles)]
-    idx = np.lexsort((corners[:, 0], corners[:, 1]))[0]
-    corners = np.roll(corners, -idx, axis=0)
+    sorted_indices = np.argsort(angles)
+    corners = corners[sorted_indices]
+    
+    # 3. Find top-left corner robustly: minimum x+y value
+    # This is geometrically stable - top-left always has smallest sum
+    sum_coords = corners[:, 0] + corners[:, 1]
+    top_left_idx = np.argmin(sum_coords)
+    
+    # 4. Roll so top-left is first
+    corners = np.roll(corners, -top_left_idx, axis=0)
+    
     return corners.astype(np.float32)
 
 class ARtag:
-    def __init__(self, corners, id, orientation_steps):
+    def __init__(self, corners, id, orientation_steps, visual_orientation=None, total_orientation=None):
         self.corners = corners
         self.id = id
-        self.orientation_steps = orientation_steps
-        self.rotation = orientation_steps * 90
+        self.orientation_steps = orientation_steps  # Discrete pattern rotation (0-3)
+        self.rotation = orientation_steps * 90  # Pattern rotation in degrees
+        self.visual_orientation = visual_orientation  # 2D visual rotation from detected corners
+        self.total_orientation = total_orientation  # Total = visual + pattern rotation
 
 def compute_homography_manual(src_pts, dst_pts):
     """Solves Homography using SVD (No OpenCV)"""
@@ -448,6 +525,89 @@ def perspective_transform_manual(points, matrix):
     z[np.abs(z) < 1e-9] = 1.0 # Avoid div zero
     out = projected[:, :2] / z
     return out
+
+def compute_orientation_from_homography(H, K):
+    """
+    Compute the visual 2D orientation angle of the tag from homography.
+    This is the in-plane rotation angle of the tag as it appears in the image.
+    
+    Args:
+        H: Homography matrix (3x3) from canonical tag coords to detected corners
+        K: Camera intrinsics matrix (3x3)
+    
+    Returns:
+        Orientation angle in degrees (0-360), or None if computation fails
+    """
+    try:
+        inv_K = np.linalg.inv(K)
+        A = inv_K @ H
+        
+        # Extract rotation columns
+        col1 = A[:, 0]
+        col2 = A[:, 1]
+        
+        # Normalize to get rotation vectors
+        norm = (np.linalg.norm(col1) + np.linalg.norm(col2)) / 2.0
+        if norm == 0:
+            return None
+            
+        r1 = col1 / norm
+        r2 = col2 / norm
+        r3 = np.cross(r1, r2)
+        
+        # Construct rotation matrix
+        R = np.column_stack([r1, r2, r3])
+        
+        # Orthogonalize using SVD
+        U, _, Vt = np.linalg.svd(R)
+        R = U @ Vt
+        
+        # Extract orientation angle from rotation matrix
+        # This is the Z-axis rotation (yaw) - how the tag is rotated in the image plane
+        angle = np.arctan2(R[1, 0], R[0, 0]) * 180.0 / np.pi
+        
+        # Normalize to 0-360 range
+        if angle < 0:
+            angle += 360.0
+            
+        return angle
+    except:
+        return None
+
+def compute_visual_orientation_simple(corners):
+    """
+    Compute the simple 2D visual orientation from corner positions.
+    This is the angle the marker needs to rotate to align with canonical orientation.
+    Uses edge vectors for robustness against corner ordering noise.
+    
+    Args:
+        corners: 4x2 array of corner positions (ordered: top-left, top-right, bottom-right, bottom-left)
+    
+    Returns:
+        Orientation angle in degrees (0-360)
+    """
+    # Use edge vectors instead of single corner - much more robust!
+    # Average the orientation from two edges to reduce noise
+    
+    # Edge from corner 0 to corner 1 (top edge)
+    edge1 = corners[1] - corners[0]
+    angle1 = np.arctan2(edge1[1], edge1[0]) * 180.0 / np.pi
+    
+    # Edge from corner 3 to corner 0 (left edge) - should be perpendicular
+    edge2 = corners[0] - corners[3]
+    angle2 = np.arctan2(edge2[1], edge2[0]) * 180.0 / np.pi
+    
+    # Use the top edge angle as primary orientation
+    # In canonical orientation, top edge points right (0°)
+    visual_angle = angle1
+    
+    # Normalize to 0-360 range
+    while visual_angle < 0:
+        visual_angle += 360.0
+    while visual_angle >= 360:
+        visual_angle -= 360.0
+    
+    return visual_angle
 
 def decode_tag(marker_pixels, gray_image): 
     corners = get_corners(marker_pixels)
@@ -490,12 +650,20 @@ def decode_tag(marker_pixels, gray_image):
     elif grid_vals[2, 5] == 1: rotation = 3
     else: return None
     
+    # Don't compute orientation yet - will do it after corner smoothing
+    # This ensures orientation is consistent with smoothed corners
+    visual_orientation = None
+    
     if rotation > 0:
         grid_vals = np.rot90(grid_vals, k=rotation)
         corners = np.roll(corners, shift=-rotation, axis=0)
 
     found_id = (grid_vals[3,3]*8) + (grid_vals[3,4]*4) + (grid_vals[4,4]*2) + (grid_vals[4,3]*1)
-    return ARtag(corners, found_id, rotation)
+    
+    # Total orientation will be computed later from smoothed corners
+    total_orientation = None
+    
+    return ARtag(corners, found_id, rotation, visual_orientation, total_orientation)
 
 def compute_projection_matrix(corners, K, tag_id = None, alpha = 0.1):
     src_pts = np.array([[0,0], [200,0], [200,200], [0,200]], dtype=np.float32)
@@ -580,15 +748,30 @@ def render(img, obj, projection, scale=3, color=False):
     return img
 
 def read_intrinsics(path):
+    """
+    Read camera intrinsics from file.
+    Supports .npz (numpy format) and .txt (plain text) formats.
+    """
     K = np.array([[1000, 0, 960], [0, 1000, 540], [0, 0, 1]], dtype=np.float32)
+    
     try:
+        # Try numpy .npz format first (from calibration script)
+        if path.endswith('.npz'):
+            data = np.load(path)
+            if 'camera_matrix' in data:
+                K = data['camera_matrix'].astype(np.float32)
+                return K
+        
+        # Fall back to text format
         with open(path, 'r') as f:
             content = f.read()
             import re
             nums = re.findall(r'[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?', content)
             if len(nums) >= 9:
                 K = np.array(nums[:9], dtype=np.float32).reshape(3, 3)
-    except: pass
+    except Exception as e:
+        print(f"Warning: Could not read intrinsics from {path}, using default. Error: {e}")
+    
     return K
 
 
@@ -641,8 +824,18 @@ def process_frame_marking(frame, scale=4, smoother=None):
             if tag:
                 detected_tag_ids.add(tag.id)
                 
-                # Apply Kalman tracking
+                # Apply Kalman tracking to corners FIRST
                 tag.corners = tracker.track_corners(tag.id, tag.corners)
+                
+                # Compute orientation from NORMALIZED, SMOOTHED corners
+                # These corners are already in canonical order (pattern rotation applied)
+                # So the visual orientation directly tells us the total orientation
+                tag.visual_orientation = compute_visual_orientation_simple(tag.corners)
+                tag.total_orientation = tag.visual_orientation  # Already accounts for pattern rotation
+                
+                # Smooth orientation angle
+                if tag.total_orientation is not None:
+                    tag.total_orientation = tracker.smooth_orientation(tag.id, tag.total_orientation)
                 
                 detected_tags.append(tag)
     
@@ -660,8 +853,13 @@ def process_frame_marking(frame, scale=4, smoother=None):
         
         cx = int(sum(c[0] for c in tag.corners) / 4)
         cy = int(sum(c[1] for c in tag.corners) / 4)
-        text = f"ID:{tag.id} {tag.rotation}deg"
-        cv2.putText(frame, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        
+        # Display ID and total orientation
+        if tag.total_orientation is not None:
+            text = f"ID:{tag.id} {tag.total_orientation:.1f}°"
+        else:
+            text = f"ID:{tag.id} {tag.rotation}°"
+        cv2.putText(frame, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
         
     return frame
 

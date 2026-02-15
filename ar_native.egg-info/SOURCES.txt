@@ -1,9 +1,0 @@
-README.md
-pyproject.toml
-setup.py
-ar_native.egg-info/PKG-INFO
-ar_native.egg-info/SOURCES.txt
-ar_native.egg-info/dependency_links.txt
-ar_native.egg-info/not-zip-safe
-ar_native.egg-info/top_level.txt
-native/ar_native.cpp

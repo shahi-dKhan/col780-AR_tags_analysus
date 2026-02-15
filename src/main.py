@@ -14,9 +14,58 @@ def main():
     parser.add_argument("--scale", type=float, help="Scale factor for 3D model.", default=50.0)
 
     args = parser.parse_args()
-    template_image = cv2.imread(args.template) if args.template else None
+    
+    # Determine video source and appropriate intrinsics
     video_source = args.video if args.video else 0
-    cap = cv2.VideoCapture(video_source)
+    using_webcam = (video_source == 0)
+    
+    # Only require calibration for 3D model mode
+    needs_calibration = (args.model is not None)
+    
+    # Auto-select intrinsics based on video source (only for 3D mode)
+    if needs_calibration:
+        if args.intrinsics == "assets/videos_and_intrinsics/intrinsics.txt":  # Default wasn't overridden
+            if using_webcam:
+                # Webcam mode - look for webcam calibration
+                webcam_intrinsics_path = "assets/videos_and_intrinsics/webcam_intrinsics.npz"
+                if os.path.exists(webcam_intrinsics_path):
+                    intrinsics_path = webcam_intrinsics_path
+                    print(f"Using webcam calibration: {intrinsics_path}")
+                else:
+                    print("\n" + "="*70)
+                    print("ERROR: Webcam calibration not found for 3D mode!")
+                    print("="*70)
+                    print("\nYou're using 3D model overlay with webcam but no calibration exists.")
+                    print("Please calibrate your webcam first using:")
+                    print("\n  python calibrate_camera.py --mode both --num-images 20")
+                    print("\nThis will:")
+                    print("  1. Capture calibration images from your webcam")
+                    print("  2. Compute camera intrinsics")
+                    print("  3. Save to:", webcam_intrinsics_path)
+                    print("\nNote: Tag detection and 2D overlay don't need calibration.")
+                    print("See CAMERA_CALIBRATION.md for detailed instructions.")
+                    print("="*70 + "\n")
+                    return
+            else:
+                # Video file mode - use default intrinsics.txt
+                intrinsics_path = args.intrinsics
+                print(f"Using video file intrinsics: {intrinsics_path}")
+        else:
+            # User explicitly specified intrinsics - use that
+            intrinsics_path = args.intrinsics
+            print(f"Using custom intrinsics: {intrinsics_path}")
+    else:
+        # Tag marking or 2D overlay - no calibration needed
+        intrinsics_path = None
+        if using_webcam:
+            print("Using webcam (calibration not needed for 2D modes)")
+        else:
+            print(f"Using video file (calibration not needed for 2D modes)")
+    
+    template_image = cv2.imread(args.template) if args.template else None
+    
+    # Use FFMPEG backend explicitly for better codec support
+    cap = cv2.VideoCapture(video_source, cv2.CAP_FFMPEG) if isinstance(video_source, str) else cv2.VideoCapture(video_source)
     if not cap.isOpened():
         print(f"Error opening source: {video_source}")
         return
@@ -56,7 +105,7 @@ def main():
         # Process frame based on mode
         if args.model:
             # 3D model rendering
-            frame = process_frame_3D(frame, args.model, args.intrinsics, scale_3d=args.scale, scale=4, smoother=kalman_tracker_3d)
+            frame = process_frame_3D(frame, args.model, intrinsics_path, scale_3d=args.scale, scale=4, smoother=kalman_tracker_3d)
         elif args.template:
             # 2D template superimposition
             frame = process_frame_superimpose(frame, args.template, scale=4, smoother=kalman_tracker_2d)
