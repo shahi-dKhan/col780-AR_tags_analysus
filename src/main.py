@@ -2,7 +2,7 @@ import cv2 # OpenCV - for image read/write, video capture, and display
 import argparse
 import time
 import os
-from smoothening_utils import * # Define custom CV functions in utils.py
+from utils import * # Define custom CV functions in utils.py
 # from utils_optimised import *
 def main():
     parser = argparse.ArgumentParser(description="AR Tag Detection and Overlay")
