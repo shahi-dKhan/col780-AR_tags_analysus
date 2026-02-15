@@ -85,7 +85,7 @@
     
     \textbf{Step 4: Corner Extraction} — Apply convex hull algorithm to the boundary pixels, followed by Douglas-Peucker polygon approximation with adaptive epsilon values (ranging from 0.01 to 0.08 of perimeter) to find exactly 4 corners. The corners are then sorted counter-clockwise starting from the top-left corner based on angular position relative to the centroid.
     
-    \textbf{Step 5: Tag Decoding} — We compute a homography matrix from the detected corners to an $8 \times 8$ canonical grid using SVD-based least squares. For each cell in the grid, sample multiple points (5$\times$5 sub-samples per cell) and use median voting to determine if the cell is white (1) or black (0). This provides robustness against noise.
+    \textbf{Step 5: Tag Decoding} — We compute a homography matrix from the detected corners to an $8 \times 8$ canonical grid using SVD-based least squares. The implementation approach was adapted from~\cite{rastogi_artag}. For each cell in the grid, sample multiple points (5$\times$5 sub-samples per cell) and use median voting to determine if the cell is white (1) or black (0). This provides robustness against noise.
     
     \textbf{Step 6: Orientation \& ID Extraction} — Identify the orientation by checking which corner cell contains the white orientation marker at positions $(5,5)$, $(5,2)$, $(2,2)$, or $(2,5)$, corresponding to $0^\circ$, $90^\circ$, $180^\circ$, or $270^\circ$ rotations. Rotate the grid to canonical orientation and decode the 4-bit ID from the inner cells at positions $(3,3)$, $(3,4)$, $(4,4)$, and $(4,3)$ using binary encoding $(8 + 4 + 2 + 1)$.
     
@@ -107,7 +107,7 @@
     \begin{itemize}
         \item First, we used fast numpy operations to replace the pure python loops, which gave us a significant boost in performance. 
         \item Then, we implemented a downsampling approach to reduce the image size, and hence the complexity. The idea was that once we find the approximate location of the Black Pixels in the downsampled image, we can then go back to the original image, and find the exact location of the black pixels by running a look around algorithm. This approach gave a significant boost in performance, as we were able to reduce the complexity from $O(n \times m)$ to $O((n/8) \times (m/8))$ while still maintaining the accuracy of our detection.
-        \item Finally, we used the \textit{numba} library to further optimize our code, which actually gave us a significant boost in performance, as we were able to achieve an FPS of around 12, which was a huge improvement from our initial implementation. 
+        \item Finally, we used the \textit{numba}~\cite{numba_jit} library to further optimize our code, which actually gave us a significant boost in performance, as we were able to achieve an FPS of around 12, which was a huge improvement from our initial implementation. 
     \end{itemize}
 
     \textbf{Corner Detection:} One of the main challenges we faced was in the corner detection step. We initially tried using the Harris corner detection algorithm, but it did not work well for our images, as it was not able to accurately detect the corners of the AR tags. We then switched to using the convex hull algorithm followed by the Douglas-Peucker polygon approximation, which gave us much better results. However, we had to experiment with different epsilon values for the Douglas-Peucker algorithm to find the optimal value that would give us exactly 4 corners for each tag.
@@ -141,7 +141,7 @@
 
     \textbf{Step 6: Mask Generation} — Create a binary mask by warping a white image of the same size as the template. This mask defines the region where the overlay should be applied.
 
-    \textbf{Step 7: Image Composition} — Blend the warped template with the original frame using the mask:
+    \textbf{Step 7: Image Composition} — Blend the warped template with the original frame using the mask~\cite{opencv_warp}:
     \begin{equation}
         I_{output}(x, y) = \begin{cases}
             I_{warped}(x, y) & \text{if } M_{warped}(x, y) > 0 \\
@@ -151,7 +151,7 @@
 
     \subsection{Kalman Filtering for Temporal Smoothing}
     We observed significant jitter when we overlayed the image. The noise was due to continuous small variations in the raw detected corners, which caused the homography to fluctuate and resulted in a continuously rotating overlay. 
-    To address this, we implemented a Kalman filter for each corner point. The state vector for each corner includes its position and velocity.     
+    To address this, we implemented a Kalman filter for each corner point (implementation reference:~\cite{rlabbe_kalman}). The state vector for each corner includes its position and velocity.     
     We also tried other steps like exponential moving average, median voting, etc. but each of them were misplacing the template images due to significant changes in the positions of corners over the frames.
     
     \subsection{current challenges}
@@ -183,7 +183,7 @@
             0 & 0 & 1
         \end{bmatrix}
     \end{equation}
-    where $(f_x, f_y)$ are the focal lengths in pixels and $(c_x, c_y)$ is the principal point (optical center). These parameters are obtained through camera calibration and loaded from the intrinsics file.
+    where $(f_x, f_y)$ are the focal lengths in pixels and $(c_x, c_y)$ is the principal point (optical center). These parameters are obtained through camera calibration~\cite{opencv_calibration} and loaded from the intrinsics file.
 
     \subsection{Pose Estimation via Homography Decomposition}
 
@@ -285,7 +285,7 @@ The 3D AR system successfully renders complex 3D models on detected AR tags at a
 \section{Kalman Filter for Corner Tracking}
 
     This appendix provides the detailed mathematical formulation of the Kalman filter used for temporal smoothing of AR tag corners in the 2D augmented reality pipeline.
-
+    \newline
     \subsection{State Space Model}
 
     Each corner is tracked independently using a constant velocity motion model. The state vector at time $k$ is:
@@ -616,7 +616,7 @@ The 3D AR system successfully renders complex 3D models on detected AR tags at a
 
 \section{Homography Computation via SVD}
 
-    Computing the homography matrix $H$ that maps source points to destination points is fundamental to both tag decoding (Step 5) and 2D overlay (Section 2). We solve this using Singular Value Decomposition (SVD) of the Direct Linear Transform (DLT) formulation.
+    Computing the homography matrix $H$ that maps source points to destination points is fundamental to both tag decoding (Step 5) and 2D overlay (Section 2). We solve this using Singular Value Decomposition (SVD) of the Direct Linear Transform (DLT) formulation. The implementation follows the approach described in~\cite{rastogi_artag}.
 
     \subsection{Homogeneous Coordinates}
 
@@ -679,16 +679,15 @@ The 3D AR system successfully renders complex 3D models on detected AR tags at a
 
 %----------------------------------------------------------
 
-\section{Project Repository}
-\href{https://github.com/shahi-dKhan/col780-AR_tags_analysus}{github\_repo\_link}
-\section{Reference Links}
-\begin{itemize}
-    \item \href{https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html}{OpenCV Camera Calibration}
-    \item \href{https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python}{Kalman Filter Implementation in Python}
-    \item \href{https://docs.opencv.org/4.x/da/d54/group__imgproc__transform.html#gaf73673a7e8e18ec6963e3774e6a94b87}{OpenCV WarpPerspective Details}
-    \item \href{https://github.com/urastogi885/ar-tag-detection/tree/master}{A Github Repo with similar AR tag pipeline}
-    \item \href{https://github.com/numba/numba}{Numba for Python JIT Compilation}
-\end{itemize}
+\section*{Acknowledgments}
+The implementation of homography computation and AR tag detection pipeline was influenced by the work in~\cite{rastogi_artag}. Camera calibration techniques follow the methods described in~\cite{opencv_calibration}. Kalman filter implementation was guided by~\cite{rlabbe_kalman}. Perspective warping utilizes OpenCV functions~\cite{opencv_warp}. Performance optimization was enabled by the Numba JIT compiler~\cite{numba_jit}.
+
+\section*{Code Repository}
+The complete source code for this project is available at: \href{https://github.com/shahi-dKhan/col780-AR_tags_analysus}{https://github.com/shahi-dKhan/col780-AR\_tags\_analysus}
+
+%----------------------------------------------------------
+
+\printbibliography[heading=bibintoc,title={References}]
 
 %----------------------------------------------------------
 
